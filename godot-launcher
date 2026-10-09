@@ -59,6 +59,9 @@ DESKTOP_FILE = Path.home() / ".local/share/applications/godot-launcher.desktop"
 # icon theme, so everything Godot-related lives in one directory.
 ICON_FILE = DEFAULT_ROOT / "godot-logo.svg"
 SELF = Path(__file__).resolve()
+# Filled in by install.sh with the release it installed (e.g. "0.2.3"). "dev" means
+# a copy run straight from the repo, or one installed some other way.
+VERSION = "dev"
 
 # Godot's Linux binaries are named e.g. Godot_v4.7.1-stable_mono_linux.x86_64
 BINARY_RE = re.compile(
@@ -864,7 +867,7 @@ class LauncherWindow(QWidget):
         self.dotnet_checked = False
         self.dotnet_task: Task | None = None
 
-        self.setWindowTitle("Godot Launcher")
+        self.setWindowTitle(f"Godot Launcher {VERSION}" if VERSION != "dev" else "Godot Launcher (dev)")
         self.resize(520, 360)
 
         self.list = VersionList()
@@ -1119,6 +1122,7 @@ def main() -> int:
         action="store_true",
         help="with --install-latest: the standard edition instead of Mono (C#)",
     )
+    parser.add_argument("--version", action="version", version=f"godot-launcher {VERSION}")
     args, qt_args = parser.parse_known_args()
     if args.install_latest:
         return install_latest("standard" if args.standard else "mono")

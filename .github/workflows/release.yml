@@ -1,0 +1,63 @@
+name: Release
+
+# Versions every commit that changes what gets installed: v<Major.Minor>.<Patch>.
+# Major.Minor comes from the VERSION file and is bumped by hand; Patch counts up
+# from 0 by itself and restarts at 0 when VERSION changes. Commits that only touch
+# docs (README, this workflow, ...) get no version.
+
+on:
+  push:
+    branches: [main]
+    paths: [godot-launcher, install.sh, godot-logo.svg, VERSION]
+
+permissions:
+  contents: write
+
+# Two quick pushes must not hand out the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # all commits and tags, to number from
+
+      - name: Tag and release each new commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          files=(godot-launcher install.sh godot-logo.svg VERSION)
+
+          # The commits this push added, oldest first. On a first or forced push,
+          # "before" isn't an ancestor, so only the newest commit is versioned.
+          if git merge-base --is-ancestor "$BEFORE" "$GITHUB_SHA" 2>/dev/null; then
+            commits=$(git rev-list --reverse "$BEFORE..$GITHUB_SHA" -- "${files[@]}")
+          else
+            commits=$GITHUB_SHA
+          fi
+
+          for commit in $commits; do
+            if git tag --points-at "$commit" | grep -q '^v'; then
+              continue  # already versioned (a re-run)
+            fi
+            base=$(git show "$commit:VERSION" | tr -d '[:space:]')
+            if [[ ! $base =~ ^[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::VERSION must be Major.Minor like 0.2, got '$base' in ${commit:0:7}"
+              exit 1
+            fi
+            last=$(git tag --list "v$base.*" --sort=-v:refname | head -n1)
+            if [[ -n $last ]]; then patch=$(( ${last##*.} + 1 )); else patch=0; fi
+            tag=v$base.$patch
+
+            git tag "$tag" "$commit"
+            git push origin "refs/tags/$tag"
+            gh release create "$tag" --verify-tag --title "$tag" \
+              --notes "$(git log -1 --format=%B "$commit")"
+            echo "Released $tag for ${commit:0:7}"
+          done

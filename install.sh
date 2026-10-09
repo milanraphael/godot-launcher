@@ -19,10 +19,11 @@ ROOT="$HOME/Applications/Godot"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
 # Where the launcher's files are downloaded from when install.sh runs on its own
-# (curl … | bash): the newest commit on main, see section 0. Overridable for testing.
+# (curl … | bash): the latest release, see section 0. Overridable for testing.
 REPO=milanraphael/godot-launcher
 BRANCH=main
 SOURCE="${GODOT_LAUNCHER_SOURCE:-}"
+version=dev  # written into the installed launcher (window title, --version)
 
 dotnet=ask
 for arg in "$@"; do
@@ -59,18 +60,19 @@ if [[ -z $HERE || ! -f $HERE/godot-launcher ]]; then
     command -v curl >/dev/null || die "curl is needed to download the launcher"
     say "Downloading Godot Launcher"
     if [[ -z $SOURCE ]]; then
-        # raw.githubusercontent.com caches .../main/... for up to 5 minutes, so right
-        # after a push it can still serve the old launcher. A commit URL never goes
-        # stale, so ask the API (not cached) which commit main is on.
-        commit=$(curl -fsSL -H 'Accept: application/vnd.github.sha' \
-            "https://api.github.com/repos/$REPO/commits/$BRANCH" 2>/dev/null || true)
-        if [[ $commit =~ ^[0-9a-f]{40}$ ]]; then
-            SOURCE=https://raw.githubusercontent.com/$REPO/$commit
-            note "version: ${commit:0:7} (latest on $BRANCH)"
+        # Install the latest release. Ask the API (not cached) for its tag: files under
+        # .../main/... can be up to 5 minutes stale right after a push, but a new
+        # tag's URL never is. Releases are made by .github/workflows/release.yml.
+        tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+            sed -n 's/^ *"tag_name": *"\(v[0-9][0-9.]*\)".*/\1/p' | head -n1 || true)
+        if [[ -n $tag ]]; then
+            SOURCE=https://raw.githubusercontent.com/$REPO/$tag
+            version=${tag#v}
+            note "version: $tag (latest release)"
         else
             # e.g. GitHub's API limit (60 requests an hour) reached: fine, maybe minutes old.
             SOURCE=https://raw.githubusercontent.com/$REPO/$BRANCH
-            note "version: latest on $BRANCH (couldn't look up the commit; may be a few minutes old)"
+            note "version: latest on $BRANCH (couldn't look up the latest release; may be a few minutes old)"
         fi
     fi
     HERE=$(mktemp -d)
@@ -81,7 +83,12 @@ if [[ -z $HERE || ! -f $HERE/godot-launcher ]]; then
     done
     # A login page or error HTML would otherwise be installed as the launcher.
     head -n1 "$HERE/godot-launcher" | grep -q '^#!/usr/bin/env python3' || die "downloaded launcher looks wrong; nothing installed"
+elif command -v git >/dev/null && git -C "$HERE" rev-parse --git-dir &>/dev/null; then
+    # From a clone: e.g. 0.2.3, or 0.2.3-2-gabc1234[-dirty] with changes since that release.
+    version=$(git -C "$HERE" describe --tags --match 'v[0-9]*' --dirty 2>/dev/null || echo dev)
+    version=${version#v}
 fi
+[[ $version =~ ^[0-9A-Za-z.+-]+$ ]] || version=dev
 
 # --- 1. dependencies ------------------------------------------------------------
 say "Checking dependencies"
@@ -196,7 +203,8 @@ fi
 # --- 3. launcher + icon ---------------------------------------------------------
 say "Installing launcher"
 install -Dm755 "$HERE/godot-launcher" "$BIN_DIR/godot-launcher"
-note "$BIN_DIR/godot-launcher"
+sed -i "s/^VERSION = \"dev\"$/VERSION = \"$version\"/" "$BIN_DIR/godot-launcher"
+note "$BIN_DIR/godot-launcher (version $version)"
 
 mkdir -p "$ROOT"
 if [[ -f $HERE/godot-logo.svg ]]; then

@@ -1,5 +1,7 @@
 # Godot Launcher
 
+[![Latest release](https://img.shields.io/github/v/release/milanraphael/godot-launcher?sort=semver)](https://github.com/milanraphael/godot-launcher/releases/latest)
+
 One pinnable "Godot Launcher" app for KDE Plasma that lists every Godot version in
 `~/Applications/Godot/` and launches the one you pick. Right-click the panel icon to jump straight
 to a version. **Install…** downloads any stable Godot 4 release from GitHub, and **Remove…**
@@ -26,7 +28,7 @@ bash install.sh
 Or clone the repo and run `./install.sh`.
 
 Run it as your normal user. It asks for `sudo` only to install missing packages. Re-running it is
-safe, and it's also how you update the launcher.
+safe, and it's also how you update the launcher: it installs the latest release.
 
 ### Options
 
@@ -95,13 +97,26 @@ To remove a version, select it and click **Remove…** (or press Delete, or righ
 folder (Mono) or binary (standard) goes to the Trash, so it can be restored from there. Projects
 and editor settings aren't touched. A version that's still running has to be closed first.
 
+## Versions
+
+Releases are numbered `vMajor.Minor.Patch`, e.g. `v0.2.3`. Every commit that changes what gets
+installed is released automatically with the next Patch number; commits that only change docs
+aren't. Major.Minor comes from the `VERSION` file and is bumped by hand, which restarts Patch at 0.
+See [all releases](https://github.com/milanraphael/godot-launcher/releases).
+
+The installed version shows in the launcher's window title and with `godot-launcher --version`.
+Installed from a clone, it reads like `0.2.3-2-gabc1234`: two commits after `v0.2.3`, plus
+`-dirty` with uncommitted changes.
+
 ## Files
 
 | File | Purpose |
 |---|---|
-| `install.sh` | The installer. Uses the files next to it, or downloads them from this repo when run on its own |
+| `install.sh` | The installer. Uses the files next to it, or downloads the latest release when run on its own |
 | `godot-launcher` | The launcher |
 | `godot-logo.svg` | Official Godot logo |
+| `VERSION` | Major.Minor of the next release |
+| `.github/workflows/release.yml` | Tags and publishes a release for every commit that changes the files above |
 
 ## Credits
 
