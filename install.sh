@@ -51,8 +51,11 @@ note "sudo is only used for pacman, and only when something is missing; pacman l
 echo
 
 # --- 0. launcher files: next to this script, or downloaded -----------------------
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)
-if [[ ! -f $HERE/godot-launcher ]]; then
+# Piped into bash there's no script file: download, even if the current folder
+# happens to hold a godot-launcher (a clone, or ~/.local/bin itself).
+HERE=""
+[[ -n ${BASH_SOURCE[0]:-} ]] && HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [[ -z $HERE || ! -f $HERE/godot-launcher ]]; then
     command -v curl >/dev/null || die "curl is needed to download the launcher"
     say "Downloading Godot Launcher"
     if [[ -z $SOURCE ]]; then
