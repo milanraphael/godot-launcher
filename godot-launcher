@@ -1,0 +1,1105 @@
+#!/usr/bin/env python3
+"""Godot Launcher — pick a Godot version from ~/Applications/Godot/ and run it.
+
+The directory is rescanned on every run, so newly downloaded versions show up
+with no configuration. The launcher also keeps the Actions= jump list in its own
+.desktop file in sync, so a version can be launched by right-clicking the pinned
+panel icon without opening this window.
+
+Install… downloads any stable Godot 4 release from GitHub into the same
+directory; Remove… (also the Delete key, or right-click a version) moves one to
+the Trash. Without a window (e.g. over SSH):
+
+    godot-launcher --install-latest [--standard]
+
+Set GODOT_LAUNCHER_ROOT to scan somewhere other than ~/Applications/Godot.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+from PyQt6.QtCore import QFile, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+DEFAULT_ROOT = Path.home() / "Applications" / "Godot"
+DESKTOP_FILE = Path.home() / ".local/share/applications/godot-launcher.desktop"
+# The official Godot logo, kept alongside the engine folders rather than in the
+# icon theme, so everything Godot-related lives in one directory.
+ICON_FILE = DEFAULT_ROOT / "godot-logo.svg"
+SELF = Path(__file__).resolve()
+
+# Godot's Linux binaries are named e.g. Godot_v4.7.1-stable_mono_linux.x86_64
+BINARY_RE = re.compile(
+    r"^Godot_v(?P<ver>\d+(?:\.\d+)*)-(?P<chan>stable|beta\d*|rc\d*|alpha\d*|dev\d*)"
+    r"(?P<mono>_mono)?_linux[._](?P<arch>x86_64|x86_32|arm64|arm32)$"
+)
+# Image suffixes matter: the icon lives inside the scan root, so exclude artwork
+# explicitly rather than relying on the Godot_v prefix check alone.
+SKIP_SUFFIXES = {".zip", ".tpz", ".txt", ".md", ".sha256", ".json", ".desktop", ".svg", ".png"}
+
+RELEASES_URL = "https://api.github.com/repos/godotengine/godot/releases?per_page=100"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "godot-launcher"
+RELEASES_CACHE = CACHE_DIR / "releases.json"
+# GitHub allows 60 unauthenticated API requests an hour; refreshing hourly is plenty.
+CACHE_TTL = 3600
+USER_AGENT = {"User-Agent": "godot-launcher"}
+ARCH = {"x86_64": "x86_64", "aarch64": "arm64"}.get(platform.machine())
+
+
+@dataclass(frozen=True)
+class Install:
+    path: Path
+    display: str
+    mono: bool
+    action_id: str
+    sort_key: tuple
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "godot"
+
+
+def _describe(path: Path) -> Install:
+    """Build an Install from a binary path, falling back to the raw filename."""
+    match = BINARY_RE.match(path.name)
+    if not match:
+        # Unrecognised naming still gets listed — better visible than silently dropped.
+        return Install(path, path.name, False, _slug(path.name), ((), 0, path.name.lower()))
+
+    version, channel = match["ver"], match["chan"]
+    mono = bool(match["mono"])
+    display = f"Godot {version}" if channel == "stable" else f"Godot {version} {channel}"
+    version_tuple = tuple(int(part) for part in version.split("."))
+    stable_rank = 1 if channel == "stable" else 0
+    action_id = _slug(f"{display} {'mono' if mono else ''}")
+    return Install(path, display, mono, action_id, (version_tuple, stable_rank, path.name.lower()))
+
+
+def scan_root() -> Path:
+    # resolve(): children inherit it, so stored paths are always absolute —
+    # desktop-entry Exec= is invalid otherwise.
+    return Path(os.environ.get("GODOT_LAUNCHER_ROOT") or DEFAULT_ROOT).expanduser().resolve()
+
+
+def discover(root: Path | str | None = None) -> list[Install]:
+    """Find every Godot binary in root, newest first.
+
+    Handles both shapes Godot actually ships: Mono builds extract to a folder
+    holding the binary next to GodotSharp/, standard builds are a bare binary.
+    """
+    root = Path(root).expanduser().resolve() if root else scan_root()
+    if not root.is_dir():
+        return []
+
+    candidates: list[Path] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if entry.is_file():
+            candidates.append(entry)
+        elif entry.is_dir():
+            try:
+                candidates.extend(child for child in sorted(entry.iterdir()) if child.is_file())
+            except OSError:
+                continue
+
+    installs: dict[Path, Install] = {}
+    for candidate in candidates:
+        if not candidate.name.startswith("Godot_v") or candidate.suffix in SKIP_SUFFIXES:
+            continue
+        if not os.access(candidate, os.X_OK):
+            continue
+        resolved = candidate.resolve()
+        if resolved not in installs:
+            installs[resolved] = _describe(candidate)
+
+    return sorted(installs.values(), key=lambda i: i.sort_key, reverse=True)
+
+
+def launch(install: Install) -> None:
+    """Start Godot detached, so quitting the launcher cannot take it down."""
+    subprocess.Popen(
+        [str(install.path)],
+        cwd=str(install.path.parent),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# --- removing versions ---------------------------------------------------------
+
+
+def removal_target(install: Install, root: Path | None = None) -> Path:
+    """What removing an install takes away: its folder (Mono builds), else the bare binary.
+
+    A hand-made folder holding several Godot binaries is never removed along
+    with one of them; only that binary goes.
+    """
+    root = Path(root).expanduser().resolve() if root else scan_root()
+    folder = install.path.parent
+    if folder == root:
+        return install.path
+    shares_folder = any(i.path.parent == folder and i.path != install.path for i in discover(root))
+    return install.path if shares_folder else folder
+
+
+def running_from(target: Path) -> bool:
+    """True if a running process was started from target.
+
+    Linux happily deletes a running binary, but a Mono build still loads
+    assemblies from GodotSharp/ while it runs, so removal waits until it's closed.
+    """
+    target = target.resolve()
+    for exe in Path("/proc").glob("[0-9]*/exe"):
+        try:
+            path = Path(os.readlink(exe))
+        except OSError:  # other users' processes, or already gone
+            continue
+        if path == target or target in path.parents:
+            return True
+    return False
+
+
+def disk_size(path: Path) -> int:
+    if not path.is_dir() or path.is_symlink():
+        return path.lstat().st_size
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if not child.is_dir() or child.is_symlink():
+                total += child.lstat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _human(size: int) -> str:
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1000:
+            return f"{size:.0f} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1000
+    return f"{size:.1f} GB"
+
+
+# --- desktop entry / jump list -------------------------------------------------
+
+
+def render_desktop(installs: list[Install]) -> str:
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=Godot Launcher",
+        "GenericName=Game Engine",
+        "Comment=Choose a Godot version to launch",
+        f'Exec="{SELF}"',
+        f"Icon={ICON_FILE}",
+        "Terminal=false",
+        "Categories=Development;IDE;",
+        "Keywords=godot;gamedev;engine;",
+        "StartupNotify=true",
+        "Actions=" + "".join(f"{i.action_id};" for i in installs),
+        "",
+    ]
+    for install in installs:
+        name = f"{install.display} (Mono)" if install.mono else install.display
+        lines += [
+            # No Path= here: it is invalid inside a Desktop Action group, and Godot
+            # locates GodotSharp/ relative to the executable rather than the cwd.
+            f"[Desktop Action {install.action_id}]",
+            f"Name={name}",
+            f'Exec="{install.path}"',
+            f"Icon={ICON_FILE}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def scanning_default_root() -> bool:
+    return scan_root() == DEFAULT_ROOT.expanduser().resolve()
+
+
+def sync_desktop(installs: list[Install]) -> bool:
+    """Rewrite the .desktop file only if the version set changed.
+
+    Skipped entirely when scanning a non-default root, so a test run against a
+    throwaway directory cannot clobber the real jump list.
+    """
+    if not scanning_default_root():
+        return False
+
+    contents = render_desktop(installs)
+    try:
+        if DESKTOP_FILE.read_text() == contents:
+            return False
+    except OSError:
+        pass
+
+    DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(dir=DESKTOP_FILE.parent, prefix=".godot-launcher-", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w") as stream:
+            stream.write(contents)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, DESKTOP_FILE)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return True
+
+
+def refresh_caches() -> None:
+    for command in (
+        ["update-desktop-database", str(DESKTOP_FILE.parent)],
+        ["kbuildsycoca6", "--noincremental"],
+    ):
+        try:
+            subprocess.Popen(
+                command,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+
+
+# --- downloading releases ------------------------------------------------------
+
+
+class InstallError(Exception):
+    pass
+
+
+class Cancelled(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Release:
+    tag: str  # e.g. "4.7.2-stable"
+    version: str  # e.g. "4.7.2"
+    published: str  # YYYY-MM-DD
+    assets: tuple  # (name, url) pairs; a tuple keeps the dataclass hashable
+
+    def url(self, name: str) -> str | None:
+        return dict(self.assets).get(name)
+
+    def zip_name(self, edition: str) -> str:
+        if edition == "mono":
+            return f"Godot_v{self.tag}_mono_linux_{ARCH}.zip"
+        return f"Godot_v{self.tag}_linux.{ARCH}.zip"
+
+    def available(self, edition: str) -> bool:
+        return ARCH is not None and self.url(self.zip_name(edition)) is not None
+
+    def target(self, edition: str, root: Path) -> Path:
+        # Both zip shapes extract to a single entry named after the zip, minus .zip.
+        return root / self.zip_name(edition).removesuffix(".zip")
+
+
+def _version_key(version: str) -> tuple:
+    return tuple(int(part) for part in version.split("."))
+
+
+def fetch_releases() -> list[Release]:
+    """Stable Godot releases this machine can run, newest version first.
+
+    Only Godot 4+ survives the filter: Godot 3 names its Linux builds "x11",
+    which zip_name() never matches. The list is cached for CACHE_TTL, and a
+    stale cache is used if GitHub can't be reached.
+    """
+    raw = None
+    try:
+        if time.time() - RELEASES_CACHE.stat().st_mtime < CACHE_TTL:
+            raw = json.loads(RELEASES_CACHE.read_text())
+    except (OSError, ValueError):
+        pass
+
+    if raw is None:
+        try:
+            request = Request(RELEASES_URL, headers={**USER_AGENT, "Accept": "application/vnd.github+json"})
+            with urlopen(request, timeout=20) as response:
+                data = json.load(response)
+            raw = [
+                {
+                    "tag": release["tag_name"],
+                    "published": (release.get("published_at") or "")[:10],
+                    "assets": [[a["name"], a["browser_download_url"]] for a in release["assets"]],
+                }
+                for release in data
+                if not release.get("draft") and not release.get("prerelease")
+            ]
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            RELEASES_CACHE.write_text(json.dumps(raw))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            try:
+                raw = json.loads(RELEASES_CACHE.read_text())
+            except (OSError, ValueError):
+                raise InstallError(f"Could not reach GitHub ({error}).") from error
+
+    releases = []
+    for entry in raw:
+        version = entry["tag"].removesuffix("-stable")
+        if entry["tag"].endswith("-stable") and re.fullmatch(r"\d+(\.\d+)*", version):
+            assets = tuple((name, url) for name, url in entry["assets"])
+            releases.append(Release(entry["tag"], version, entry["published"], assets))
+    releases = [r for r in releases if r.available("mono") or r.available("standard")]
+    # Sort by version, not date: maintenance releases (4.5.2) can ship after newer ones (4.6.1).
+    return sorted(releases, key=lambda r: _version_key(r.version), reverse=True)
+
+
+def _download(url: str, dest: Path, label: str, report, cancelled) -> str:
+    """Stream url to dest, returning its SHA-512."""
+    digest = hashlib.sha512()
+    with urlopen(Request(url, headers=USER_AGENT), timeout=30) as response, open(dest, "wb") as out:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        while chunk := response.read(1 << 17):
+            if cancelled():
+                raise Cancelled
+            out.write(chunk)
+            digest.update(chunk)
+            done += len(chunk)
+            report(label, done, total)
+    return digest.hexdigest()
+
+
+def _extract(archive_path: Path, dest: Path, cancelled) -> None:
+    dest.mkdir()
+    base = dest.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            if cancelled():
+                raise Cancelled
+            path = (base / info.filename).resolve()
+            if not path.is_relative_to(base):
+                raise InstallError(f"Refusing unsafe path in archive: {info.filename}")
+            archive.extract(info, base)
+            # zipfile drops Unix permissions; restore them so binaries stay executable.
+            mode = (info.external_attr >> 16) & 0o777
+            if mode and not info.is_dir():
+                path.chmod(mode)
+
+
+def install_release(release: Release, edition: str, root: Path, report, cancelled=lambda: False) -> Path:
+    """Download, verify and unpack one Godot build into root; returns its path.
+
+    Everything happens in a scratch directory first, so a failed or cancelled
+    install never leaves a half-unpacked version behind for discover() to list.
+    report(label, done, total) receives progress; total is 0 when unknown.
+    """
+    name = release.zip_name(edition)
+    target = release.target(edition, root)
+    zip_url, sums_url = release.url(name), release.url("SHA512-SUMS.txt")
+    if target.exists():
+        raise InstallError(f"Godot {release.version} is already installed.")
+    if not zip_url:
+        raise InstallError(f"Godot {release.version} has no {name}.")
+    if not sums_url:
+        raise InstallError(f"Godot {release.version} has no checksum file; not installing it unverified.")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix="install-"))
+    try:
+        report("Fetching checksums", 0, 0)
+        with urlopen(Request(sums_url, headers=USER_AGENT), timeout=30) as response:
+            sums = response.read().decode()
+        expected = None
+        for line in sums.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].lstrip("*") == name:
+                expected = parts[0].lower()
+        if not expected:
+            raise InstallError(f"{name} is missing from the checksum file.")
+
+        digest = _download(zip_url, work / name, f"Downloading Godot {release.version}", report, cancelled)
+        if digest != expected:
+            raise InstallError("Checksum mismatch: the download is corrupted or was tampered with. Nothing was installed.")
+
+        report("Unpacking", 0, 0)
+        _extract(work / name, work / "extract", cancelled)
+        unpacked = work / "extract" / target.name
+        if not unpacked.exists():
+            raise InstallError(f"Unexpected layout inside {name}.")
+        binaries = [unpacked] if unpacked.is_file() else [
+            child for child in unpacked.iterdir() if child.is_file() and child.name.startswith("Godot_v")
+        ]
+        for binary in binaries:
+            binary.chmod(binary.stat().st_mode | 0o755)
+
+        if cancelled():
+            raise Cancelled
+        root.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(unpacked), str(target))
+        return target
+    except (OSError, zipfile.BadZipFile) as error:
+        raise InstallError(f"Install failed: {error}") from error
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+DOTNET_HINT = "Install it with:  sudo pacman -S dotnet-sdk   (or re-run the launcher's install.sh)"
+
+
+def _sdk_key(version: str) -> tuple:
+    return tuple(int(part) if part.isdigit() else -1 for part in re.split(r"[.-]", version))
+
+
+def dotnet_sdk() -> tuple[str, Path] | None:
+    """(newest SDK version, dotnet path) of the .NET that Godot would use, or None.
+
+    Godot's Mono edition needs a .NET SDK to build C# projects. Checked in the
+    order Godot finds one: PATH first, then Microsoft's install script location
+    (~/.dotnet) and pacman's (/usr/share/dotnet). Takes a fraction of a second,
+    so the window runs it off the UI thread.
+    """
+    candidates = [shutil.which("dotnet"), Path.home() / ".dotnet/dotnet", "/usr/share/dotnet/dotnet"]
+    for candidate in candidates:
+        if candidate and os.access(candidate, os.X_OK):
+            try:
+                result = subprocess.run(
+                    [str(candidate), "--list-sdks"], capture_output=True, text=True, timeout=15
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            versions = [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
+            if versions:
+                return max(versions, key=_sdk_key), Path(candidate).resolve()
+    return None
+
+
+def has_dotnet_sdk() -> bool:
+    return dotnet_sdk() is not None
+
+
+def install_latest(edition: str) -> int:
+    """The --install-latest command line path: no window, progress on stderr."""
+    root = scan_root()
+    progress_line = False
+
+    def report(label: str, done: int, total: int) -> None:
+        nonlocal progress_line
+        if total:
+            print(f"\r{label}: {done * 100 // total}% of {total / 1e6:.0f} MB", end="", file=sys.stderr, flush=True)
+            progress_line = True
+        else:
+            print(("\n" if progress_line else "") + label, file=sys.stderr)
+            progress_line = False
+
+    try:
+        release = next((r for r in fetch_releases() if r.available(edition)), None)
+        if release is None:
+            print(f"error: no stable Godot release found for this machine ({platform.machine()})", file=sys.stderr)
+            return 1
+        target = release.target(edition, root)
+        if target.exists():
+            print(f"Godot {release.version} ({edition}) is already installed: {_tidy(target)}", flush=True)
+        else:
+            path = install_release(release, edition, root, report)
+            print(("\n" if progress_line else "") + f"Installed Godot {release.version} ({edition}) to {_tidy(path)}", flush=True)
+        if edition == "mono" and not has_dotnet_sdk():
+            print(f"note: no .NET SDK found, so C# projects won't build yet. {DOTNET_HINT}", file=sys.stderr)
+    except InstallError as error:
+        print(("\n" if progress_line else "") + f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ncancelled", file=sys.stderr)
+        return 130
+
+    if sync_desktop(discover()):
+        refresh_caches()
+    return 0
+
+
+# --- ui ------------------------------------------------------------------------
+
+
+def _tidy(path: Path) -> str:
+    text = str(path)
+    home = str(Path.home())
+    return "~" + text[len(home):] if text.startswith(home) else text
+
+
+def _dim(widget: QWidget) -> str:
+    palette = widget.palette()
+    return palette.color(palette.ColorGroup.Disabled, palette.ColorRole.WindowText).name()
+
+
+class Task(QThread):
+    """Runs fn(report, cancelled) off the UI thread so downloads don't freeze the window."""
+
+    progress = pyqtSignal(str, object, object)
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)  # empty message means cancelled
+
+    def __init__(self, fn, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            result = self._fn(self.progress.emit, lambda: self._cancel)
+        except Cancelled:
+            self.failed.emit("")
+        except InstallError as error:
+            self.failed.emit(str(error))
+        except Exception as error:  # noqa: BLE001 — surface anything rather than die silently
+            self.failed.emit(f"Unexpected error: {error}")
+        else:
+            self.succeeded.emit(result)
+
+
+class InstallDialog(QDialog):
+    """Pick a stable release and edition, then download it into the scan root."""
+
+    def __init__(self, root: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.root = root
+        self.releases: list[Release] = []
+        self.installed_path: Path | None = None
+        self.task: Task | None = None
+        self.closing = False
+
+        self.setWindowTitle("Install Godot")
+        self.resize(440, 440)
+
+        self.list = QListWidget()
+        self.list.currentRowChanged.connect(lambda _row: self._update_button())
+        self.list.itemDoubleClicked.connect(lambda _item: self._install())
+
+        self.mono = QRadioButton("Mono (C#)")
+        self.standard = QRadioButton("Standard")
+        self.mono.setChecked(True)
+        self.mono.toggled.connect(lambda _checked: self._refresh_labels())
+        edition = QHBoxLayout()
+        edition.addWidget(QLabel("Edition:"))
+        edition.addWidget(self.mono)
+        edition.addWidget(self.standard)
+        edition.addStretch(1)
+
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.hide()
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        self.install_button = QPushButton("Install")
+        self.install_button.setDefault(True)
+        self.install_button.clicked.connect(self._install)
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        footer.addWidget(self.cancel_button)
+        footer.addWidget(self.install_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        layout.addWidget(self.list)
+        layout.addLayout(edition)
+        layout.addWidget(self.status)
+        layout.addWidget(self.progress)
+        layout.addLayout(footer)
+
+        self._load()
+
+    def edition(self) -> str:
+        return "mono" if self.mono.isChecked() else "standard"
+
+    def selected(self) -> Release | None:
+        row = self.list.currentRow()
+        return self.releases[row] if 0 <= row < len(self.releases) else None
+
+    # loading the release list
+
+    def _load(self) -> None:
+        self.status.setText("Loading releases from GitHub…")
+        self.install_button.setEnabled(False)
+        self.progress.setRange(0, 0)
+        self.progress.show()
+        self.task = Task(lambda report, cancelled: fetch_releases(), self)
+        self.task.succeeded.connect(self._loaded)
+        self.task.failed.connect(self._load_failed)
+        self.task.start()
+
+    def _loaded(self, releases: list[Release]) -> None:
+        self.task = None
+        self.progress.hide()
+        if self.closing:
+            super().reject()
+            return
+        self.releases = releases
+        if not releases:
+            self._load_failed(f"No stable Godot builds found for this machine ({platform.machine()}).")
+            return
+        self.status.setText(f"Installs into {_tidy(self.root)}")
+        self.status.setStyleSheet(f"color:{_dim(self)};")
+        self.list.clear()
+        for release in releases:
+            item = QListWidgetItem(self.list)
+            item.setToolTip(f"Released {release.published}" if release.published else "")
+        self._refresh_labels()
+        self.list.setCurrentRow(0)
+        self.list.setFocus()
+
+    def _load_failed(self, message: str) -> None:
+        self.task = None
+        self.progress.hide()
+        if self.closing:
+            super().reject()
+            return
+        self.status.setStyleSheet("")
+        self.status.setText(message)
+        self.install_button.setText("Retry")
+        self.install_button.setEnabled(True)
+
+    def _refresh_labels(self) -> None:
+        edition = self.edition()
+        for row, release in enumerate(self.releases):
+            notes = []
+            if row == 0:
+                notes.append("latest")
+            if release.target(edition, self.root).exists():
+                notes.append("installed")
+            elif not release.available(edition):
+                notes.append("not available")
+            text = f"Godot {release.version}"
+            self.list.item(row).setText(text + ("   ·   " + ", ".join(notes) if notes else ""))
+        self._update_button()
+
+    def _update_button(self) -> None:
+        if self.task is not None:
+            return
+        if not self.releases:
+            return
+        release, edition = self.selected(), self.edition()
+        installed = release is not None and release.target(edition, self.root).exists()
+        self.install_button.setText("Installed" if installed else "Install")
+        self.install_button.setEnabled(release is not None and release.available(edition) and not installed)
+
+    # installing
+
+    def _install(self) -> None:
+        if self.task is not None:
+            return
+        if not self.releases:
+            self._load()
+            return
+        release, edition = self.selected(), self.edition()
+        if release is None or not release.available(edition) or release.target(edition, self.root).exists():
+            return
+
+        self._set_busy(True)
+        self.status.setStyleSheet("")
+        self.status.setText(f"Installing Godot {release.version}…")
+        root = self.root
+        self.task = Task(lambda report, cancelled: install_release(release, edition, root, report, cancelled), self)
+        self.task.progress.connect(self._progress)
+        self.task.succeeded.connect(self._installed)
+        self.task.failed.connect(self._install_failed)
+        self.task.start()
+
+    def _set_busy(self, busy: bool) -> None:
+        for widget in (self.list, self.mono, self.standard, self.install_button):
+            widget.setEnabled(not busy)
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(busy)
+
+    def _progress(self, label: str, done: int, total: int) -> None:
+        if total:
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(done * 1000 // total)
+            self.status.setText(f"{label} — {done / 1e6:.0f} of {total / 1e6:.0f} MB")
+        else:
+            self.progress.setRange(0, 0)
+            self.status.setText(f"{label}…")
+
+    def _installed(self, path: Path) -> None:
+        self.task = None
+        self.installed_path = path
+        self.accept()
+
+    def _install_failed(self, message: str) -> None:
+        self.task = None
+        self._set_busy(False)
+        if self.closing:
+            super().reject()
+            return
+        self.status.setText(message or "Install cancelled.")
+        self._refresh_labels()
+
+    def reject(self) -> None:
+        # Never destroy a running thread: ask it to stop and close once it has.
+        if self.task is not None and self.task.isRunning():
+            self.closing = True
+            self.task.cancel()
+            self.cancel_button.setEnabled(False)
+            self.status.setText("Cancelling…")
+            return
+        super().reject()
+
+
+class Row(QWidget):
+    """Two-line list row. Transparent to the mouse so the list handles clicks."""
+
+    def __init__(self, install: Install, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        palette = self.palette()
+        accent = palette.color(palette.ColorRole.Highlight).name()
+
+        title = QLabel(install.display)
+        font = title.font()
+        font.setBold(True)
+        font.setPointSizeF(font.pointSizeF() + 1.0)
+        title.setFont(font)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
+        top.addWidget(title)
+        if install.mono:
+            badge = QLabel("Mono")
+            badge_font = badge.font()
+            badge_font.setPointSizeF(max(7.0, badge_font.pointSizeF() - 1.0))
+            badge.setFont(badge_font)
+            badge.setStyleSheet(
+                f"color:{accent};border:1px solid {accent};border-radius:4px;padding:0px 5px;"
+            )
+            top.addWidget(badge)
+        top.addStretch(1)
+
+        subtitle = QLabel(_tidy(install.path))
+        sub_font = subtitle.font()
+        sub_font.setPointSizeF(max(7.0, sub_font.pointSizeF() - 1.0))
+        subtitle.setFont(sub_font)
+        subtitle.setStyleSheet(f"color:{_dim(self)};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(2)
+        layout.addLayout(top)
+        layout.addWidget(subtitle)
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        for child in self.findChildren(QWidget):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+
+class LauncherWindow(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.installs: list[Install] = []
+        # .NET SDK shown in the footer: (version, path), None if missing, unset until checked.
+        self.dotnet: tuple[str, Path] | None = None
+        self.dotnet_checked = False
+        self.dotnet_task: Task | None = None
+
+        self.setWindowTitle("Godot Launcher")
+        self.resize(520, 360)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list.setUniformItemSizes(False)
+        self.list.itemActivated.connect(self._launch_item)
+        self.list.itemDoubleClicked.connect(self._launch_item)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._show_menu)
+
+        # Shown instead of the list when no versions are found.
+        empty_title = QLabel("No Godot versions installed yet")
+        title_font = empty_title.font()
+        title_font.setBold(True)
+        title_font.setPointSizeF(title_font.pointSizeF() + 2.0)
+        empty_title.setFont(title_font)
+        empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_hint = QLabel()
+        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.setStyleSheet(f"color:{_dim(self)};")
+        empty_install = QPushButton("Install…")
+        empty_install.setMinimumWidth(160)
+        empty_install.clicked.connect(self._open_installer)
+        centered = QHBoxLayout()
+        centered.addStretch(1)
+        centered.addWidget(empty_install)
+        centered.addStretch(1)
+
+        empty = QWidget()
+        empty_layout = QVBoxLayout(empty)
+        empty_layout.addStretch(1)
+        empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(self.empty_hint)
+        empty_layout.addSpacing(8)
+        empty_layout.addLayout(centered)
+        empty_layout.addStretch(1)
+
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.list)
+        self.pages.addWidget(empty)
+
+        self.status = QLabel()
+        self.install_button = QPushButton("Install…")
+        self.install_button.clicked.connect(self._open_installer)
+        self.remove_button = QPushButton("Remove…")
+        self.remove_button.clicked.connect(self._remove_selected)
+        self.rescan_button = QPushButton("Rescan")
+        self.rescan_button.clicked.connect(lambda: self.reload())
+        self.launch_button = QPushButton("Launch")
+        self.launch_button.setDefault(True)
+        self.launch_button.clicked.connect(self._launch_selected)
+
+        footer = QHBoxLayout()
+        footer.addWidget(self.status)
+        footer.addStretch(1)
+        footer.addWidget(self.install_button)
+        footer.addWidget(self.remove_button)
+        footer.addWidget(self.rescan_button)
+        footer.addWidget(self.launch_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        layout.addWidget(self.pages)
+        layout.addLayout(footer)
+
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.close)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self, self._launch_selected)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter), self, self._launch_selected)
+        QShortcut(QKeySequence.StandardKey.Refresh, self, self.reload)
+        QShortcut(QKeySequence.StandardKey.Delete, self, self._remove_selected)
+
+        self.reload()
+
+    def reload(self, select: Path | None = None) -> None:
+        self.installs = discover()
+        self.list.clear()
+
+        for install in self.installs:
+            item = QListWidgetItem(self.list)
+            row = Row(install)
+            item.setSizeHint(row.sizeHint())
+            self.list.setItemWidget(item, row)
+
+        found = bool(self.installs)
+        self.pages.setCurrentIndex(0 if found else 1)
+        self.install_button.setVisible(found)
+        self.remove_button.setVisible(found)
+        self.launch_button.setEnabled(found)
+        if found:
+            # Select the version just installed (its folder or bare binary), else the newest.
+            row = next(
+                (i for i, inst in enumerate(self.installs) if select in (inst.path, inst.path.parent)),
+                0,
+            )
+            self.list.setCurrentRow(row)
+        else:
+            self.empty_hint.setText(
+                f"Install one from GitHub, or unzip a Godot download into {_tidy(scan_root())}"
+            )
+        self._update_status()
+
+        if sync_desktop(self.installs):
+            refresh_caches()
+        self._check_dotnet()
+
+    def _check_dotnet(self) -> None:
+        # Rechecked on every reload, so installing .NET and pressing Rescan updates the footer.
+        if self.dotnet_task is not None and self.dotnet_task.isRunning():
+            return
+        self.dotnet_task = Task(lambda report, cancelled: dotnet_sdk(), self)
+        self.dotnet_task.succeeded.connect(self._dotnet_checked)
+        self.dotnet_task.failed.connect(lambda _message: self._dotnet_checked(None))
+        self.dotnet_task.start()
+
+    def _dotnet_checked(self, sdk: tuple[str, Path] | None) -> None:
+        self.dotnet, self.dotnet_checked = sdk, True
+        self._update_status()
+
+    def _update_status(self) -> None:
+        if not self.installs:
+            self.status.setText("")
+            self.status.setToolTip("")
+            return
+        count = len(self.installs)
+        text = f"{count} version{'' if count == 1 else 's'} found"
+        tooltip = ""
+        # .NET only matters for Mono builds, so standard-only setups don't mention it.
+        if self.dotnet_checked and any(install.mono for install in self.installs):
+            if self.dotnet:
+                version, path = self.dotnet
+                text += f"  ·  .NET SDK {version}"
+                tooltip = f"Used by Godot's Mono edition: {_tidy(path)}"
+            else:
+                text += "  ·  No .NET SDK: C# won't build"
+                tooltip = DOTNET_HINT
+        self.status.setText(text)
+        self.status.setToolTip(tooltip)
+
+    def wait_for_background(self) -> None:
+        """Let a running .NET check finish, so Qt never destroys a live thread on exit."""
+        if self.dotnet_task is not None:
+            self.dotnet_task.wait(20_000)
+
+    def _open_installer(self) -> None:
+        dialog = InstallDialog(scan_root(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.installed_path:
+            self.reload(select=dialog.installed_path.resolve())
+            if "_mono_" in dialog.installed_path.name and not has_dotnet_sdk():
+                QMessageBox.information(
+                    self,
+                    "No .NET SDK found",
+                    "Godot's Mono edition is installed, but no .NET SDK was found, "
+                    f"so C# projects won't build yet.\n\n{DOTNET_HINT}",
+                )
+        else:
+            self.reload()  # an install may have been cancelled after other changes on disk
+
+    def _show_menu(self, pos) -> None:
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        self.list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("Launch", self._launch_selected)
+        menu.addSeparator()
+        menu.addAction("Remove…", self._remove_selected)
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    def _remove_selected(self) -> None:
+        index = self.list.currentRow()
+        if not 0 <= index < len(self.installs):
+            return
+        install = self.installs[index]
+        name = f"{install.display} (Mono)" if install.mono else install.display
+        target = removal_target(install)
+
+        if running_from(target):
+            QMessageBox.information(self, "Godot is running", f"{name} is still running. Close it first, then remove it.")
+            return
+
+        box = QMessageBox(QMessageBox.Icon.Question, "Remove Godot version", f"Remove {name}?", parent=self)
+        box.setInformativeText(
+            f"This moves {_tidy(target)} ({_human(disk_size(target))}) to the Trash.\n\n"
+            "Your projects and editor settings aren't touched."
+        )
+        remove = box.addButton("Move to Trash", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(box.addButton(QMessageBox.StandardButton.Cancel))
+        box.exec()
+        if box.clickedButton() is not remove:
+            return
+
+        trashed, _ = QFile.moveToTrash(str(target))
+        if not trashed:
+            # e.g. on a drive without a Trash folder.
+            answer = QMessageBox.warning(
+                self,
+                "Couldn't move to Trash",
+                f"{_tidy(target)} couldn't be moved to the Trash.\n\nDelete it permanently instead? This can't be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            except OSError as error:
+                QMessageBox.warning(self, "Couldn't remove", f"{_tidy(target)} couldn't be removed:\n{error}")
+                self.reload()  # part of it may be gone
+                return
+
+        # Keep the selection where it was: the next version down, else the one above.
+        rest = self.installs[index + 1:] + self.installs[:index][::-1]
+        self.reload(select=rest[0].path if rest else None)
+
+    def _launch_item(self, item: QListWidgetItem) -> None:
+        self._run(self.list.row(item))
+
+    def _launch_selected(self) -> None:
+        if not self.installs:
+            self._open_installer()
+            return
+        self._run(self.list.currentRow())
+
+    def _run(self, index: int) -> None:
+        if 0 <= index < len(self.installs):
+            launch(self.installs[index])
+            QApplication.instance().quit()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Pick a Godot version and launch it.")
+    parser.add_argument(
+        "--install-latest",
+        action="store_true",
+        help="download the latest stable Godot into the launcher's folder, without opening a window",
+    )
+    parser.add_argument(
+        "--standard",
+        action="store_true",
+        help="with --install-latest: the standard edition instead of Mono (C#)",
+    )
+    args, qt_args = parser.parse_known_args()
+    if args.install_latest:
+        return install_latest("standard" if args.standard else "mono")
+
+    app = QApplication([sys.argv[0], *qt_args])
+    app.setApplicationName("Godot Launcher")
+    app.setDesktopFileName("godot-launcher")
+
+    if ICON_FILE.exists():
+        icon = QIcon(str(ICON_FILE))
+        if not icon.isNull():
+            app.setWindowIcon(icon)
+
+    window = LauncherWindow()
+    window.show()
+    status = app.exec()
+    window.wait_for_background()
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())
